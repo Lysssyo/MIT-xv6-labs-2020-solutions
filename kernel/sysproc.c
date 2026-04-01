@@ -6,6 +6,7 @@
 #include "memlayout.h"
 #include "spinlock.h"
 #include "proc.h"
+#include "sysinfo.h"
 
 uint64
 sys_exit(void)
@@ -95,3 +96,41 @@ sys_uptime(void)
   release(&tickslock);
   return xticks;
 }
+
+uint64
+sys_trace(void)
+{
+  int mark; // 拿到方法的入参
+
+  if (argint(0, &mark) < 0)
+    return -1;
+
+  // 将参数保存到结构体
+  struct proc *p = myproc();
+  p->mask = mark;
+  return 0;
+}
+
+uint64
+sys_sysinfo(void)
+{
+  // 1. 用 argaddr 获取用户传入的指针
+  uint64 addr;
+  argaddr(0, &addr);  // addr 存的是地址的值，是用户传入的 &info 的值
+
+  struct sysinfo info;
+
+  info.freemem = kfreemem();
+
+  info.nproc = knproc();
+
+  struct proc *p = myproc();
+
+  if (copyout(p->pagetable, addr, (char *)&info, sizeof(info)) < 0)
+    return -1; // ✅ copyout 失败说明地址非法，返回错误
+    
+  return 0;
+}
+
+
+

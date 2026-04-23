@@ -20,6 +20,7 @@ static void wakeup1(struct proc *chan);
 static void freeproc(struct proc *p);
 
 extern char trampoline[]; // trampoline.S
+extern char etext[];  // kernel.ld sets this to end of kernel code.
 
 // initialize the proc table at boot time.
 void
@@ -34,14 +35,14 @@ procinit(void)
       // Allocate a page for the process's kernel stack.
       // Map it high in memory, followed by an invalid
       // guard page.
-      char *pa = kalloc();
-      if(pa == 0)
-        panic("kalloc");
-      uint64 va = KSTACK((int) (p - proc));
-      kvmmap(va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
-      p->kstack = va;
+      // char *pa = kalloc(); // 给每个进程分配一页物理内存（4096 字节）作为内核栈。pa 是这页的物理地址。
+      // if(pa == 0)
+      //   panic("kalloc");
+      // uint64 va = KSTACK((int) (p - proc));
+      // kvmmap(va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
+      // p->kstack = va;
   }
-  kvminithart();
+  // kvminithart();
 }
 
 // Must be called with interrupts disabled,
@@ -108,6 +109,7 @@ found:
   p->pid = allocpid();
 
   // Allocate a trapframe page.
+  // trapframe 是一个结构体，用来保存进程从用户态进入内核态时所有寄存器的值
   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
     release(&p->lock);
     return 0;
@@ -116,6 +118,14 @@ found:
   // An empty user page table.
   p->pagetable = proc_pagetable(p);
   if(p->pagetable == 0){
+    freeproc(p);
+    release(&p->lock);
+    return 0;
+  }
+
+  p->kpgtbl = proc_kernel_pagetable(p);
+  if (p->kpgtbl == 0)
+  {
     freeproc(p);
     release(&p->lock);
     return 0;
@@ -141,6 +151,17 @@ freeproc(struct proc *p)
   p->trapframe = 0;
   if(p->pagetable)
     proc_freepagetable(p->pagetable, p->sz);
+  if (p->kpgtbl)
+  {
+    // 先释放内核栈的物理页（kstack 是 kalloc 分配的，必须 kfree）
+    if (p->kstack)
+    {
+      uvmunmap(p->kpgtbl, p->kstack, 1, 1); // 最后一个参数 1 = 释放物理页
+      p->kstack = 0;
+    }
+    proc_free_kernel_pagetable(p->kpgtbl);
+  }
+
   p->pagetable = 0;
   p->sz = 0;
   p->pid = 0;
@@ -185,14 +206,81 @@ proc_pagetable(struct proc *p)
   return pagetable;
 }
 
+pagetable_t
+proc_kernel_pagetable(struct proc *p)
+{
+  pagetable_t pagetable;
+  // An empty page table.
+  pagetable = uvmcreate();
+  if (pagetable == 0)
+    return 0;
+
+  // uart registers
+  mappages(pagetable, UART0, PGSIZE, UART0, PTE_R | PTE_W);
+
+  // virtio mmio disk interface
+  mappages(pagetable, VIRTIO0, PGSIZE, VIRTIO0, PTE_R | PTE_W);  
+
+  // CLINT
+  //CLINT（Core Local Interruptor）用于处理时钟中断，它只在机器模式（M-mode）下被访问，而不是在管理者模式（S-mode）下。
+  // xv6 内核运行在 S-mode，进程从用户态陷入内核后也是运行在 S-mode。
+  // CLINT 的访问只发生在 start.c 中的 timerinit()，那是系统启动阶段、还在 M-mode 下完成的事情。
+  // 所以进程在内核态执行时，永远不会访问 CLINT 地址，把它映射进进程内核页表既没有必要，也会白白占用低地址空间
+  // mappages(pagetable, CLINT, 0x10000, CLINT, PTE_R | PTE_W);  
+
+  // PLIC
+  mappages(pagetable, PLIC, 0x400000, PLIC, PTE_R | PTE_W);  
+
+  // map kernel text executable and read-only.
+  mappages(pagetable, KERNBASE, (uint64)etext - KERNBASE, KERNBASE, PTE_R | PTE_X);  
+
+  // map kernel data and the physical RAM we'll make use of.
+  mappages(pagetable, (uint64)etext, PHYSTOP - (uint64)etext, (uint64)etext, PTE_R | PTE_W);  
+
+  // map the trampoline for trap entry/exit to
+  // the highest virtual address in the kernel.
+  mappages(pagetable, TRAMPOLINE, PGSIZE, (uint64)trampoline, PTE_R | PTE_X);
+
+  // 分配内核栈  
+
+  // Allocate a page for the process's kernel stack.
+  // Map it high in memory, followed by an invalid
+  // guard page.
+  char *pa = kalloc(); // 给每个进程分配一页物理内存（4096 字节）作为内核栈。pa 是这页的物理地址。
+  if (pa == 0)
+    panic("kalloc");
+
+  uint64 va = TRAMPOLINE - 2 * PGSIZE;
+  mappages(pagetable, va, PGSIZE, (uint64)pa, PTE_R | PTE_W);  
+  p->kstack = va;
+
+  return pagetable;
+}
+
 // Free a process's page table, and free the
 // physical memory it refers to.
-void
-proc_freepagetable(pagetable_t pagetable, uint64 sz)
+void proc_freepagetable(pagetable_t pagetable, uint64 sz)
 {
-  uvmunmap(pagetable, TRAMPOLINE, 1, 0);
-  uvmunmap(pagetable, TRAPFRAME, 1, 0);
-  uvmfree(pagetable, sz);
+  uvmunmap(pagetable, TRAMPOLINE, 1, 0); // 解除特殊映射（不释放物理页）
+  uvmunmap(pagetable, TRAPFRAME, 1, 0);  // 解除特殊映射（不释放物理页）
+  uvmfree(pagetable, sz);                // 先把叶子清理干净
+}
+
+void proc_free_kernel_pagetable(pagetable_t pagetable)
+{
+  for (int i = 0; i < 512; i++)
+  {
+    pte_t pte = pagetable[i];
+    if ((pte & PTE_V) && (pte & (PTE_R | PTE_W | PTE_X)) == 0)
+    {
+      // 非叶子，递归释放子页表页
+      uint64 child = PTE2PA(pte);
+      proc_free_kernel_pagetable((pagetable_t)child);
+      pagetable[i] = 0;
+    }
+    // 叶子 PTE：只清零，不 kfree 物理页
+  }
+  kfree((void *)pagetable); // 释放当前页表页本身
 }
 
 // a user program that calls exec("/init")
@@ -220,6 +308,7 @@ userinit(void)
   // and data into it.
   uvminit(p->pagetable, initcode, sizeof(initcode));
   p->sz = PGSIZE;
+  u2kvmcopy(p->pagetable, p->kpgtbl, 0, p->sz);
 
   // prepare for the very first "return" from kernel to user.
   p->trapframe->epc = 0;      // user program counter
@@ -242,12 +331,21 @@ growproc(int n)
   struct proc *p = myproc();
 
   sz = p->sz;
-  if(n > 0){
-    if((sz = uvmalloc(p->pagetable, sz, sz + n)) == 0) {
+  if(n > 0){ // 增长
+    if (sz + n > PLIC)
+    {
       return -1;
     }
+    if ((sz = uvmalloc(p->pagetable, sz, sz + n)) == 0)
+    {
+      return -1;
+    }
+    u2kvmcopy(p->pagetable, p->kpgtbl, p->sz, sz);
   } else if(n < 0){
-    sz = uvmdealloc(p->pagetable, sz, sz + n);
+    // 缩小
+    uint64 newsz = uvmdealloc(p->pagetable, sz, sz + n);
+    uvmunmap(p->kpgtbl, PGROUNDUP(newsz), (PGROUNDUP(sz) - PGROUNDUP(newsz)) / PGSIZE, 0);    
+    sz = newsz;
   }
   p->sz = sz;
   return 0;
@@ -290,6 +388,8 @@ fork(void)
   np->cwd = idup(p->cwd);
 
   safestrcpy(np->name, p->name, sizeof(p->name));
+
+  u2kvmcopy(np->pagetable, np->kpgtbl, 0, np->sz);
 
   pid = np->pid;
 
@@ -473,7 +573,12 @@ scheduler(void)
         // before jumping back to us.
         p->state = RUNNING;
         c->proc = p;
+        
+        w_satp(MAKE_SATP(p->kpgtbl));
+        sfence_vma(); // 刷新 TLB，TLB 是 CPU 里的一个硬件缓存，专门缓存页表的翻译结果
+
         swtch(&c->context, &p->context);
+        kvminithart();
 
         // Process is done running for now.
         // It should have changed its p->state before coming back.
